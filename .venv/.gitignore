@@ -1,0 +1,29 @@
+# created by virtualenv automatically
+# Игнорировать настройки среды
+.env
+*.env
+
+# Кэш и временные файлы Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Файлы среды venv
+.venv/
+venv/
+ENV/
+env/
+
+# Логи
+*.log
+
+# Конфигурации IDE
+.vscode/
+.idea/
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+.idea/
+
