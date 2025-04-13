@@ -1,7 +1,6 @@
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ConversationHandler, ContextTypes, filters
+    ApplicationBuilder, CommandHandler, MessageHandler, ConversationHandler, ContextTypes, filters
 )
 from shared import user_lang
 from handlers import get_registration_handler, registration_start
