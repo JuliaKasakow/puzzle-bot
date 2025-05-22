@@ -5,9 +5,10 @@ FILE_PATH = "data.json"
 
 def parse_capacity(value):
     try:
-        return float(value.replace(".", "").replace(",", "."))
-    except:
-        return 0.0
+        value = str(value).replace(" ", "").replace(".", "").replace(",", "")
+        return int(value)
+    except (ValueError, TypeError):
+        return 0
 
 def tier_priority(tier):
     tier = str(tier).upper().replace("Т", "T")
@@ -24,10 +25,10 @@ def load_players(filename=FILE_PATH):
 def group_by_shift(players):
     shifts = {"1": [], "2": [], "обе": []}
     for p in players:
-        shift = str(p.get("shift", "1"))
-        if shift in shifts:
+        shift = str(p.get("shift", "1")).lower()
+        if shift in ["1", "2"]:
             shifts[shift].append(p)
-        elif shift.lower() in ["both", "обе", "beide"]:
+        elif shift in ["both", "обе", "beide"]:
             shifts["обе"].append(p)
     return shifts
 
@@ -35,7 +36,6 @@ def balance_shifts(shifted):
     shift1 = shifted["1"]
     shift2 = shifted["2"]
     both = shifted["обе"]
-
     for player in both:
         if len(shift1) <= len(shift2):
             shift1.append(player)
@@ -43,94 +43,116 @@ def balance_shifts(shifted):
             shift2.append(player)
     return {"1": shift1, "2": shift2}
 
-def distribute_by_troop(players):
-    towers = {"байкер": [], "боец": [], "стрелок": []}
-    for p in players:
-        t = p.get("troop_type", "").lower()
-        for key in towers:
-            if key in t:
-                towers[key].append(p)
-                break
-    return towers
-
 def sort_players(players):
     return sorted(
         players,
         key=lambda p: (-tier_priority(p.get("tier", "")), -parse_capacity(p.get("group_capacity", "0")))
     )
 
-def assign_to_captain_group(players):
-    players = sort_players(players)
-    result = []
-    remaining = players.copy()
+def assign_captains(players):
+    candidates = [
+        p for p in players
+        if p.get("captain", "").lower() == "да"
+        and parse_capacity(p.get("true_power", "0")) >= 300_000_000
+    ]
+    if len(candidates) < 5:
+        candidates = players
 
-    while remaining:
-        captains = [p for p in remaining if p.get("captain", "").lower() in ["да", "yes", "ja"]]
-        if not captains:
-            captains = remaining
+    def sort_key(p):
+        return (
+            -parse_capacity(p.get("true_power", "0")),
+            -tier_priority(p.get("tier", "")),
+            -parse_capacity(p.get("group_capacity", "0"))
+        )
 
-        captain = max(captains, key=lambda p: parse_capacity(p.get("group_capacity", "0")))
-        group_capacity = parse_capacity(captain.get("group_capacity", "0"))
-        assigned = [{"nickname": captain["nickname"], "alliance": captain["alliance"], "as_captain": True, "used": 0, "max": group_capacity}]
-        remaining.remove(captain)
+    sorted_candidates = sorted(candidates, key=sort_key)
+    selected = []
+    used = set()
+    for p in sorted_candidates:
+        if p["nickname"] not in used:
+            selected.append(p)
+            used.add(p["nickname"])
+        if len(selected) == 5:
+            break
+    return selected
 
-        used = 0
-        sorted_remaining = sort_players(remaining)
+def assign_to_tower(captain, players, allowed_type=None, assigned_nicks=None):
+    if assigned_nicks is None:
+        assigned_nicks = set()
 
-        for p in sorted_remaining:
-            size = parse_capacity(p.get("troop_size", "0"))
-            space_left = group_capacity - used
-            if space_left <= 0:
-                break
-            if size <= space_left:
-                assigned.append({"nickname": p["nickname"], "alliance": p["alliance"], "used": size, "max": size})
-                used += size
-                remaining.remove(p)
-            else:
-                assigned.append({"nickname": p["nickname"], "alliance": p["alliance"], "used": space_left, "max": size})
-                used += space_left
-                remaining.remove(p)
+    group_capacity = parse_capacity(captain.get("group_capacity", "0"))
+    if group_capacity == 0:
+        return []
 
-        result.append({"captain": captain["nickname"], "members": assigned})
+    assigned = []
+    remaining = [p for p in players if p["nickname"] not in assigned_nicks and p["nickname"] != captain["nickname"]]
 
-    return result
+    if allowed_type:
+        remaining = [p for p in remaining if allowed_type == p.get("troop_type", "").lower()]
 
-def format_tower_output(tower_name, players):
-    output = [f"{tower_name.capitalize()}"]
-    groups = assign_to_captain_group(players)
-    for group in groups:
-        output.append(f"\nКапитан: {group['captain']}")
-        for m in group["members"]:
-            if m.get("as_captain"):
-                output.append(f"{m['nickname']} [{m['alliance']}] (капитан) — вместимость: {m['max']:.0f}")
-            else:
-                output.append(f"{m['nickname']} [{m['alliance']}] — вводит: {m['used']:.0f} из {m['max']:.0f}")
-    return "\n".join(output)
+    remaining = sorted(
+        remaining,
+        key=lambda p: (-tier_priority(p.get("tier", "")), -parse_capacity(p.get("troop_size", "0")))
+    )
 
-def get_hub_group(players):
-    best = max(players, key=lambda p: (tier_priority(p["tier"]), parse_capacity(p["group_capacity"])))
-    troop_type = best["troop_type"]
-    same_type = [p for p in players if p["troop_type"] == troop_type]
-    return format_tower_output("Хаб", same_type)
+    used = 0
+    for p in remaining:
+        if used >= group_capacity:
+            break
+        size = parse_capacity(p.get("troop_size", "0"))
+        fit_size = min(size, group_capacity - used)
+        p_copy = p.copy()
+        p_copy["assigned"] = fit_size
+        assigned.append(p_copy)
+        assigned_nicks.add(p["nickname"])
+        used += fit_size
+
+    assigned_nicks.add(captain["nickname"])
+    return assigned
+
+def format_tower(title, captain, members):
+    alliance = captain.get("alliance", "").upper()
+    lines = [
+        f"{title}",
+        f"Капитан: {captain['nickname']} [{alliance}] вместимость: {parse_capacity(captain['group_capacity']):,}".replace(",", " ")
+    ]
+    for m in members:
+        if "assigned" in m:
+            lines.append(f"{m['nickname']} [{m.get('alliance', '').upper()}] — {int(m['assigned']):,}".replace(",", " "))
+    return "\n".join(lines)
 
 def generate_distribution(filename=FILE_PATH):
-    all_players = load_players(filename)
-    shift_groups = balance_shifts(group_by_shift(all_players))
+    players = load_players(filename)
+    shifts = balance_shifts(group_by_shift(players))
     result = []
 
-    for shift, players in shift_groups.items():
-        result.append(f"Смена {shift}")
-        result.append(get_hub_group(players))
-        towers = distribute_by_troop(players)
-        used_types = set(towers.keys())
-        for name in used_types:
-            result.append(format_tower_output(f"Башня {name}", towers[name]))
+    for shift, shift_players in shifts.items():
+        result.append(f"\n🕐 Смена {shift}")
+        shift_players = sort_players(shift_players)
+        captains = assign_captains(shift_players)
 
-        # Добавим башню "Микс", если остались игроки не попавшие в основные
-        all_assigned = sum([towers[k] for k in used_types], [])
-        leftovers = [p for p in players if p not in all_assigned]
-        if leftovers:
-            result.append(format_tower_output("Башня микс", leftovers))
+        if len(captains) < 5:
+            result.append("❗ Недостаточно капитанов!")
+            continue
+
+        assigned_nicks = set(p["nickname"] for p in captains)
+
+        # Хаб
+        hub_captain = captains[0]
+        hub_type = hub_captain.get("troop_type", "").lower()
+        hub_members = assign_to_tower(hub_captain, shift_players, allowed_type=hub_type, assigned_nicks=assigned_nicks)
+        result.append(format_tower("🏠 Хаб (лучшие бойцы)", hub_captain, hub_members))
+
+        # Башни по типу
+        for i, troop_type in enumerate(["стрелок", "байкер", "боец"], start=1):
+            cap = captains[i]
+            members = assign_to_tower(cap, shift_players, allowed_type=troop_type, assigned_nicks=assigned_nicks)
+            result.append(format_tower(f"🛡 Башня {troop_type}", cap, members))
+
+        # Микс
+        mix_captain = captains[4]
+        mix_members = assign_to_tower(mix_captain, shift_players, assigned_nicks=assigned_nicks)
+        result.append(format_tower("⚔️ Башня микс", mix_captain, mix_members))
 
     return "\n\n".join(result)
 

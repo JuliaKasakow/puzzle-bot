@@ -1,36 +1,51 @@
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ConversationHandler, ContextTypes, filters
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ConversationHandler, ContextTypes, filters
 )
 from shared import user_lang
-from handlers import get_registration_handler, registration_start
+from registration import get_registration_handler
+from handlers import get_edit_conversation_handler
 from distribution import generate_distribution
-from storage import update_player_by_nickname
-import logging
-import json
-import os
+from sheets_importer import sync_from_google
+from storage import load_players
+from config import ADMINS
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
+import logging
+import os
 
 load_dotenv()
-
 TOKEN = os.getenv("BOT_TOKEN")
-ADMINS = [5281668146, 1739936136]  # Список ID администраторов
 LANG_SELECT = 0
 
-# Постоянные кнопки
 main_keyboard_user = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton("📝 Регистрация"), KeyboardButton("📋 Список")]],
+    keyboard=[[KeyboardButton("📝 Регистрация"), KeyboardButton("📋 Список (короткий)")]],
     resize_keyboard=True
 )
 
 main_keyboard_admin = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton("📝 Регистрация"), KeyboardButton("📋 Список")],
+        [KeyboardButton("📝 Регистрация"), KeyboardButton("📋 Список"), KeyboardButton("📋 Список (короткий)")],
         [KeyboardButton("/finish"), KeyboardButton("/distribute")],
-        [KeyboardButton("/edit"), KeyboardButton("/reset")]
+        [KeyboardButton("/edit"), KeyboardButton("/reset"), KeyboardButton("/sync")]
     ],
     resize_keyboard=True
 )
+
+def split_text(text, limit=4000):
+    lines = text.split('\n')
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 < limit:
+            current += line + "\n"
+        else:
+            chunks.append(current.strip())
+            current = line + "\n"
+    if current:
+        chunks.append(current.strip())
+    return chunks
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -69,112 +84,116 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_main_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if "Регистрация" in text:
-        return await registration_callback(update, context)
+        from registration import registration_start
+        return await registration_start(update, context)
+    elif "Список (короткий)" in text:
+        await show_short_list(update)
     elif "Список" in text:
-        await show_list(update, context)
+        await show_full_list(update)
 
-async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_full_list(update: Update):
+    user_id = update.effective_user.id
+    is_admin = user_id in ADMINS
     try:
-        with open("data.json", "r", encoding="utf-8") as file:
-            data = json.load(file)
+        data = load_players()
     except FileNotFoundError:
-        await update.message.reply_text("Список пуст. Никто ещё не зарегистрировался.")
+        await update.message.reply_text("Список пуст.")
         return
-
-    if not isinstance(data, list) or not data:
+    if not data:
         await update.message.reply_text("Список пуст.")
         return
 
-    lines = []
+    lines = [
+        f"{p['nickname']} | {p['alliance']} | {p['troop_type']} | {p['troop_size']} | tier {p['tier']} | shift {p['shift']} | cap: {p['captain']} | group: {p['group_capacity']}"
+        for p in data
+    ] if is_admin else [f"{p['nickname']} | {p['alliance']}" for p in data]
+
+    result = "Участники:\n" + "\n".join(lines)
+    for chunk in split_text(result):
+        await update.message.reply_text(chunk)
+
+async def show_short_list(update: Update):
+    try:
+        data = load_players()
+    except FileNotFoundError:
+        await update.message.reply_text("Список пуст.")
+        return
+    if not data:
+        await update.message.reply_text("Список пуст.")
+        return
+
+    lines = [f"{p['nickname']} | {p['alliance']}" for p in data]
     alliance_count = {}
+    for p in data:
+        tag = p.get("alliance", "").upper()
+        alliance_count[tag] = alliance_count.get(tag, 0) + 1
 
-    for player in data:
-        nick = player.get("nickname")
-        alliance = player.get("alliance")
-        if nick and alliance:
-            lines.append(f"{nick} | {alliance}")
-            tag = alliance.upper()
-            alliance_count[tag] = alliance_count.get(tag, 0) + 1
-
-    result = "Зарегистрированные участники:\n" + "\n".join(lines)
-    result += "\n\nУчастники по альянсам:"
-    for tag, count in sorted(alliance_count.items(), key=lambda x: (-x[1], x[0])):
+    result = f"Участники ({len(data)}):\n" + "\n".join(lines) + "\n\nПо альянсам:"
+    for tag, count in sorted(alliance_count.items(), key=lambda x: -x[1]):
         result += f"\n{tag}: {count}"
 
-    await update.message.reply_text(result)
+    for chunk in split_text(result):
+        await update.message.reply_text(chunk)
 
-async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("⛔ У вас нет прав на эту команду.")
+        await update.message.reply_text("⛔ Нет прав.")
         return
-    await update.message.reply_text("✅ Регистрация завершена. Расчёт башен будет добавлен позже.")
+    await update.message.reply_text("✅ Регистрация завершена.")
 
-async def reset_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("⛔ У вас нет прав на эту команду.")
+        await update.message.reply_text("⛔ Нет прав.")
         return
-
     if os.path.exists("data.json"):
         os.remove("data.json")
-        await update.message.reply_text("🗑 Регистрация сброшена.")
+        await update.message.reply_text("🗑 Сброшено.")
     else:
-        await update.message.reply_text("Файл уже пуст.")
+        await update.message.reply_text("Файл пуст.")
 
-async def registration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await registration_start(update, context)
-
-async def run_distribution(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def distribute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("⛔ У вас нет прав на эту команду.")
+        await update.message.reply_text("⛔ Нет прав.")
         return
+    await update.message.reply_text("📊 Распределение:")
+    try:
+        result = generate_distribution()
+        for chunk in split_text(result):
+            await update.message.reply_text(chunk)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при распределении: {e}")
 
-    await update.message.reply_text("📊 Распределение по башням:")
-    result = generate_distribution("data.json")
-    for block in result.split("\n\n"):
-        if block.strip():
-            await update.message.reply_text(block.strip())
-
-async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("⛔ У вас нет прав на эту команду.")
+        await update.message.reply_text("⛔ Нет прав.")
         return
+    await update.message.reply_text("🔄 Загружаю данные из Google Таблицы...")
+    count = sync_from_google()
+    await update.message.reply_text(f"✅ Загружено записей: {count}")
 
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_text("Использование: /edit <ник> <поле> <новое_значение>")
-        return
-
-    nickname = args[0]
-    field = args[1]
-    new_value = " ".join(args[2:])
-
-    if update_player_by_nickname(nickname, field, new_value):
-        await update.message.reply_text(f"✅ Обновлено: {field} у {nickname} теперь {new_value}")
-    else:
-        await update.message.reply_text("❌ Не удалось найти игрока с таким ником или поле указано неверно.")
-
-async def show_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.message.reply_text(f"Ваш user_id: {user_id}")
+def start_scheduler():
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(sync_from_google, 'interval', hours=1)
+    scheduler.start()
+    logging.info("⏰ Планировщик запущен: Google Sheets будут синхронизироваться каждый час.")
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    app = ApplicationBuilder().token(TOKEN).connect_timeout(10).read_timeout(10).build()
-
-    lang_handler = ConversationHandler(
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={LANG_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_language)]},
         fallbacks=[],
-    )
+    ))
 
-    app.add_handler(lang_handler)
     app.add_handler(get_registration_handler())
-    app.add_handler(CommandHandler("id", show_my_id))
-    app.add_handler(CommandHandler("finish", finish_registration))
-    app.add_handler(CommandHandler("reset", reset_registration))
-    app.add_handler(CommandHandler("distribute", run_distribution))
-    app.add_handler(CommandHandler("edit", edit_field))
+    app.add_handler(get_edit_conversation_handler())
+    app.add_handler(CommandHandler("finish", finish))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("distribute", distribute))
+    app.add_handler(CommandHandler("sync", sync))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_buttons))
 
+    start_scheduler()
     app.run_polling()

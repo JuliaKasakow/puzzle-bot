@@ -3,204 +3,126 @@ from telegram.ext import (
     CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters
 )
-from shared import user_lang
-from languages import questions
-from storage import save_to_json
-from utils import validate_troop_input
-import random
-import re
+from config import ADMINS
+from storage import load_players, update_player_by_nickname, delete_player_by_nickname
+from utils import validate_troop_input, validate_tier, validate_shift, validate_power
 
-user_answers = {}
+EDIT_SELECT_PLAYER, EDIT_SELECT_FIELD, EDIT_ENTER_VALUE, EDIT_CONFIRM_DELETE = range(9, 13)
 
-(
-    STEP_NICK, STEP_ALLIANCE, STEP_TYPE, STEP_SIZE,
-    STEP_TIER, STEP_CAPACITY, STEP_SHIFT, STEP_CAPTAIN
-) = range(8)
+def is_admin(user_id):
+    return user_id in ADMINS
 
-tips = {
-    "ru": [
-        "🛡 Надень щит во время ДЗ, чтобы сохранить ресурсы!",
-        "🏰 Участвуй в защите башен, чтобы получить бонусы альянса.",
-        "⚔️ Размещай юниты соответствующего типа в башне.",
-        "📦 Проверь вместимость своих отрядов перед событием.",
-        "⏰ Не забудь про смену по времени — будь онлайн заранее!",
-        "👑 Король Пустоши требует координации — пиши в альянс-чате!",
-        "🚫 Если не можешь участвовать — предупреди и не занимай слот.",
-        "💬 Назначай капитанов заранее, чтобы избежать путаницы.",
-        "🧪 Усиливай отряд баффами перед битвой за башню.",
-        "🔄 Проверяй свою смену и тип войск — не перепутай!",
-        "📦 Вскрывай ящики под ивенты — получишь больше наград.",
-        "🧱 Не храни ресурсы на стене — их легко потерять.",
-        "🕊 Если вышел на плитку одновременно с врагом — надень щит!",
-        "⛏ Не собирай ресурсы в грязи во время Пустоши — это опасно.",
-        "🛑 Не пиши в боевом дивизионе до договора о НАП.",
-        "⚠️ Не атакуй чужие башни до договора о НАП.",
-        "🚫 Нападения на башни в своём регионе запрещены.",
-        "🏕 Не ставь свою штаб-квартиру на грязь — это опасно."
-    ],
-    "en": [],
-    "de": []
-}
+async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ У вас нет прав.")
+        return
 
-# Старт регистрации
-async def registration_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    lang = user_lang.get(chat_id, "ru")
-    user_answers[chat_id] = []
+    players = load_players()
+    if not players:
+        await update.message.reply_text("Список пуст.")
+        return
 
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.message.reply_text(questions[lang][0])
+    buttons = [[InlineKeyboardButton(p['nickname'], callback_data=f"edit_nick|{p['nickname']}")] for p in players]
+    await update.message.reply_text("Выберите участника:", reply_markup=InlineKeyboardMarkup(buttons))
+    return EDIT_SELECT_PLAYER
+
+async def edit_player_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    await update.callback_query.answer()
+    _, nickname = update.callback_query.data.split("|")
+    context.user_data["edit_nick"] = nickname
+
+    fields = ["nickname", "alliance", "troop_type", "troop_size", "tier", "group_capacity", "shift", "captain", "true_power"]
+    buttons = [[InlineKeyboardButton(field, callback_data=f"edit_field|{field}")] for field in fields]
+    buttons.append([InlineKeyboardButton("❌ Удалить", callback_data="delete_user")])
+
+    await update.callback_query.edit_message_text("Выберите поле для изменения или удалите:", reply_markup=InlineKeyboardMarkup(buttons))
+    return EDIT_SELECT_FIELD
+
+async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.callback_query.answer()
+    _, field = update.callback_query.data.split("|")
+    context.user_data["edit_field"] = field
+    await update.callback_query.edit_message_text(f"Введите новое значение для {field}:")
+    return EDIT_ENTER_VALUE
+
+async def apply_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    nickname = context.user_data["edit_nick"]
+    field = context.user_data["edit_field"]
+    value = update.message.text.strip()
+
+    if field == "troop_size" and not validate_troop_input(value):
+        await update.message.reply_text("❌ Отряд: число от 200000 до 700000.")
+        return EDIT_ENTER_VALUE
+
+    if field == "tier" and not validate_tier(value):
+        await update.message.reply_text("❌ Тир должен быть от T10 до T13.")
+        return EDIT_ENTER_VALUE
+
+    if field == "group_capacity" and not validate_troop_input(value):
+        await update.message.reply_text("❌ Группа: число от 800000 до 3.500.000.")
+        return EDIT_ENTER_VALUE
+
+    if field == "shift" and not validate_shift(value):
+        await update.message.reply_text("❌ Смена должна быть 1, 2 или обе.")
+        return EDIT_ENTER_VALUE
+
+    if field == "true_power":
+        if not validate_power(value) or int(value) < 300_000_000:
+            await update.message.reply_text("❌ Личная мощь должна быть числом от 300.000.000.")
+            return EDIT_ENTER_VALUE
+
+    if update_player_by_nickname(nickname, field, value):
+        await update.message.reply_text(f"✅ Обновлено: {nickname}.{field} = {value}")
     else:
-        await update.message.reply_text(questions[lang][0])
+        await update.message.reply_text("❌ Не удалось изменить.")
+    return ConversationHandler.END
 
-    return STEP_NICK
+async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("Удалить участника?", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("Да", callback_data="delete_confirm")],
+        [InlineKeyboardButton("Отмена", callback_data="delete_cancel")]
+    ]))
+    return EDIT_CONFIRM_DELETE
 
-# Ответы текстом
-async def collect_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    lang = user_lang.get(chat_id, "ru")
-    text = update.message.text.strip()
-    step = len(user_answers.get(chat_id, []))
+async def delete_user_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.callback_query.answer()
+    nickname = context.user_data["edit_nick"]
+    delete_player_by_nickname(nickname)
+    await update.callback_query.edit_message_text(f"🗑 Участник {nickname} удалён.")
+    return ConversationHandler.END
 
-    if not text:
-        await update.message.reply_text({
-            "ru": "Это поле обязательно. Пожалуйста, введите ответ.",
-            "de": "Dieses Feld ist erforderlich. Bitte gib eine Antwort ein.",
-            "en": "This field is required. Please provide an answer."
-        }[lang])
-        return step
+async def delete_user_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("Удаление отменено.")
+    return ConversationHandler.END
 
-    if step == STEP_ALLIANCE:
-        if re.search(r"[А-Яа-яЁё]", text):
-            await update.message.reply_text({
-                "ru": "Название альянса должно быть на латинице (без кириллицы).",
-                "de": "Der Allianzname darf keine kyrillischen Buchstaben enthalten.",
-                "en": "Alliance name must not contain Cyrillic letters."
-            }[lang])
-            return step
-
-    if step in [STEP_SIZE, STEP_CAPACITY]:
-        if not validate_troop_input(text):
-            await update.message.reply_text({
-                "ru": "Введите значение числом не менее 6 знаков, например: 456000",
-                "de": "Bitte gib eine Zahl mit mindestens 6 Zeichen ein, z. B.: 456000",
-                "en": "Enter a number with at least 6 characters, e.g.: 456000"
-            }[lang])
-            return step
-
-    user_answers[chat_id].append(text)
-    step += 1
-
-    if step == STEP_TYPE:
-        return await send_troop_type_buttons(update, lang)
-    elif step == STEP_SHIFT:
-        return await send_shift_buttons(update, lang)
-    elif step == STEP_CAPTAIN:
-        return await send_captain_buttons(update, lang)
-    elif step < len(questions[lang]):
-        await update.message.reply_text(questions[lang][step])
-        return step
-    else:
-        save_to_json(chat_id, user_answers[chat_id])
-        await update.message.reply_text(get_thank_you(lang))
-        await update.message.reply_text(random.choice(tips[lang]))
-        return ConversationHandler.END
-
-# Обработка кнопок
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    chat_id = query.message.chat_id
-    lang = user_lang.get(chat_id, "ru")
-    await query.answer()
-
-    user_answers.setdefault(chat_id, []).append(query.data)
-    step = len(user_answers[chat_id])
-
-    if step == STEP_SHIFT:
-        return await send_shift_buttons(update, lang)
-    elif step == STEP_CAPTAIN:
-        return await send_captain_buttons(update, lang)
-    elif step < len(questions[lang]):
-        await query.message.reply_text(questions[lang][step])
-        return step
-    else:
-        save_to_json(chat_id, user_answers[chat_id])
-        await query.message.reply_text(get_thank_you(lang))
-        await query.message.reply_text(random.choice(tips[lang]))
-        return ConversationHandler.END
-
-# Благодарность
-
-def get_thank_you(lang):
-    return {
-        "ru": "Спасибо! Вы зарегистрированы. 👍",
-        "de": "Danke! Du bist angemeldet. 👍",
-        "en": "Thank you! You are registered. 👍"
-    }[lang]
-
-# Кнопки — тип войск
-async def send_troop_type_buttons(update, lang):
-    options = {
-        "ru": ["байкер", "боец", "стрелок"],
-        "de": ["Biker", "Kämpfer", "Schütze"],
-        "en": ["biker", "fighter", "shooter"]
-    }
-    buttons = [[InlineKeyboardButton(text=opt, callback_data=opt)] for opt in options[lang]]
-    await update.message.reply_text(
-        questions[lang][STEP_TYPE],
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-    return STEP_TYPE
-
-# Кнопки — смена
-async def send_shift_buttons(update, lang):
-    options = {
-        "ru": ["1", "2", "обе"],
-        "de": ["1", "2", "beide"],
-        "en": ["1", "2", "both"]
-    }
-    buttons = [[InlineKeyboardButton(text=opt, callback_data=opt)] for opt in options[lang]]
-    target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text(
-        questions[lang][STEP_SHIFT],
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-    return STEP_SHIFT
-
-# Кнопки — капитан
-async def send_captain_buttons(update, lang):
-    options = {
-        "ru": ["да", "нет"],
-        "de": ["ja", "nein"],
-        "en": ["yes", "no"]
-    }
-    buttons = [[InlineKeyboardButton(text=opt, callback_data=opt)] for opt in options[lang]]
-    target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text(
-        questions[lang][STEP_CAPTAIN],
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-    return STEP_CAPTAIN
-
-# Handler
-
-def get_registration_handler():
+def get_edit_conversation_handler():
     return ConversationHandler(
         entry_points=[
-            CommandHandler("register", registration_start),
-            CallbackQueryHandler(registration_start, pattern="^start_registration$"),
-            MessageHandler(filters.Regex("Регистрация"), registration_start)
+            CommandHandler("edit", edit_command),
+            MessageHandler(filters.Regex("Список"), edit_command)
         ],
         states={
-            STEP_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_answer)],
-            STEP_ALLIANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_answer)],
-            STEP_TYPE: [CallbackQueryHandler(handle_button)],
-            STEP_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_answer)],
-            STEP_TIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_answer)],
-            STEP_CAPACITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_answer)],
-            STEP_SHIFT: [CallbackQueryHandler(handle_button)],
-            STEP_CAPTAIN: [CallbackQueryHandler(handle_button)],
+            EDIT_SELECT_PLAYER: [CallbackQueryHandler(edit_player_callback, pattern="^edit_nick\\|")],
+            EDIT_SELECT_FIELD: [
+                CallbackQueryHandler(edit_field_callback, pattern="^edit_field\\|"),
+                CallbackQueryHandler(confirm_delete, pattern="^delete_user$")
+            ],
+            EDIT_ENTER_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, apply_edit)],
+            EDIT_CONFIRM_DELETE: [
+                CallbackQueryHandler(delete_user_confirm, pattern="^delete_confirm$"),
+                CallbackQueryHandler(delete_user_cancel, pattern="^delete_cancel$")
+            ]
         },
         fallbacks=[]
     )
